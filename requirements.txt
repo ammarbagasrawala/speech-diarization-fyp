@@ -4,6 +4,7 @@
 #
 #    pip-compile
 #
+
 aiohappyeyeballs==2.6.1
     # via aiohttp
 aiohttp==3.11.17
@@ -433,6 +434,7 @@ websockets==15.0.1
     # via uvicorn
 yarl==1.20.0
     # via aiohttp
+gunicorn==23.0.0
 
 # The following packages are considered to be unsafe in a requirements file:
 # setuptools
