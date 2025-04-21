@@ -244,7 +244,7 @@ def perform_diarization(audio_path, hf_token=None):
     
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.0",
-        use_auth_token=hf_token
+        use_auth_token=os.environ["HF_TOKEN"]
     )
     
     diarization = pipeline(audio_path)
