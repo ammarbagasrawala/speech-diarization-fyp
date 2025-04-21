@@ -1,4 +1,3 @@
-# app.py
 import os
 import uuid
 import time
@@ -20,9 +19,17 @@ from typing import Dict, List, Optional
 import uvicorn
 import logging
 
+import whisper_timestamped as whisper
+import os
+import json
+
+import noisereduce as nr
+import soundfile as sf
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+
 DEFAULT_HF_TOKEN = os.environ.get("HF_TOKEN", "")
-print(DEFAULT_HF_TOKEN)
-hf_token=os.environ.get("HF_TOKEN", "")
 
 # Setup logging
 logging.basicConfig(
@@ -73,6 +80,55 @@ with open(os.path.join(templates_dir, "index.html"), "w") as f:
             .error { background-color: #f8d7da; border-color: #f5c6cb; color: #721c24; }
             #results { margin-top: 20px; }
             pre { background-color: #f8f9fa; padding: 10px; border-radius: 5px; overflow-x: auto; }
+            
+            /* Toggle switch styles */
+            .switch {
+                position: relative;
+                display: inline-block;
+                width: 60px;
+                height: 34px;
+            }
+            .switch input {
+                opacity: 0;
+                width: 0;
+                height: 0;
+            }
+            .slider {
+                position: absolute;
+                cursor: pointer;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background-color: #ccc;
+                transition: .4s;
+                border-radius: 34px;
+            }
+            .slider:before {
+                position: absolute;
+                content: "";
+                height: 26px;
+                width: 26px;
+                left: 4px;
+                bottom: 4px;
+                background-color: white;
+                transition: .4s;
+                border-radius: 50%;
+            }
+            input:checked + .slider {
+                background-color: #4CAF50;
+            }
+            input:checked + .slider:before {
+                transform: translateX(26px);
+            }
+            .toggle-container {
+                display: flex;
+                align-items: center;
+                margin-bottom: 15px;
+            }
+            .toggle-label {
+                margin-left: 10px;
+            }
         </style>
     </head>
     <body>
@@ -83,6 +139,27 @@ with open(os.path.join(templates_dir, "index.html"), "w") as f:
                     <label for="audioFile">Upload Audio File (WAV, MP3, etc.):</label>
                     <input type="file" id="audioFile" name="audioFile" accept="audio/*" required>
                 </div>
+                
+                <div class="form-group">
+                    <div class="toggle-container">
+                        <label class="switch">
+                            <input type="checkbox" id="useTimestamps" name="useTimestamps">
+                            <span class="slider"></span>
+                        </label>
+                        <span class="toggle-label">Enable transcriptions with timestamps</span>
+                    </div>
+                </div>
+                
+                <div class="form-group">
+                    <div class="toggle-container">
+                        <label class="switch">
+                            <input type="checkbox" id="reduceNoise" name="reduceNoise">
+                            <span class="slider"></span>
+                        </label>
+                        <span class="toggle-label">Remove background noise from speaker voice notes</span>
+                    </div>
+                </div>
+                
                 <div class="form-group">
                     <input type="hidden" id="hfToken" name="hfToken" value="{DEFAULT_HF_TOKEN}">
                 </div>
@@ -106,11 +183,15 @@ with open(os.path.join(templates_dir, "index.html"), "w") as f:
                 const formData = new FormData();
                 const audioFile = document.getElementById('audioFile').files[0];
                 const hfToken = document.getElementById('hfToken').value;
+                const useTimestamps = document.getElementById('useTimestamps').checked;
+                const reduceNoise = document.getElementById('reduceNoise').checked;
                 
                 formData.append('audio_file', audioFile);
                 if (hfToken) {
                     formData.append('hf_token', hfToken);
                 }
+                formData.append('use_timestamps', useTimestamps);
+                formData.append('reduce_noise', reduceNoise);
                 
                 const status = document.getElementById('status');
                 status.style.display = 'block';
@@ -158,9 +239,20 @@ with open(os.path.join(templates_dir, "index.html"), "w") as f:
                             
                             for (const [speaker, path] of Object.entries(result.speaker_audio_paths || {})) {
                                 downloadLinks.innerHTML += `<li><a href="/download/${jobId}/${speaker}" download>${speaker}.wav</a></li>`;
+                                
+                                // Add noise reduced files if they exist
+                                if (result.noise_reduced && result.noise_reduced[speaker]) {
+                                    downloadLinks.innerHTML += `<li><a href="/download/${jobId}/${result.noise_reduced[speaker]}" download>${speaker}_noise_reduced.wav</a></li>`;
+                                }
                             }
                             
-                            downloadLinks.innerHTML += `<li><a href="/download/${jobId}/transcriptions.txt" download>transcriptions.txt</a></li>`;
+                            // Add transcription file download links
+                            if (result.has_timestamps) {
+                                downloadLinks.innerHTML += `<li><a href="/download/${jobId}/transcriptions_with_timestamps.json" download>transcriptions_with_timestamps.json</a></li>`;
+                            } else {
+                                downloadLinks.innerHTML += `<li><a href="/download/${jobId}/transcriptions.txt" download>transcriptions.txt</a></li>`;
+                            }
+                            
                             downloadLinks.innerHTML += '</ul>';
                             
                             // Display transcriptions
@@ -168,7 +260,13 @@ with open(os.path.join(templates_dir, "index.html"), "w") as f:
                             transcriptions.innerHTML = '<h3>Transcriptions</h3><pre>';
                             
                             for (const [speaker, text] of Object.entries(result.transcriptions || {})) {
-                                transcriptions.innerHTML += `${speaker}: ${text}\n\n`;
+                                if (typeof text === 'object' && text.text) {
+                                    // This is a timestamped transcription
+                                    transcriptions.innerHTML += `<strong>${speaker}:</strong> ${text.text}<br><br>`;
+                                } else {
+                                    // This is a regular transcription
+                                    transcriptions.innerHTML += `<strong>${speaker}:</strong> ${text}<br><br>`;
+                                }
                             }
                             
                             transcriptions.innerHTML += '</pre>';
@@ -200,15 +298,19 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 jobs = {}
 
 class Job:
-    def __init__(self, job_id, audio_path, hf_token=None):
+    def __init__(self, job_id, audio_path, hf_token=None, use_timestamps=False, reduce_noise=False):
         self.job_id = job_id
         self.audio_path = audio_path
         self.hf_token = hf_token
+        self.use_timestamps = use_timestamps
+        self.reduce_noise = reduce_noise
         self.status = "pending"
         self.result_dir = os.path.join(RESULTS_DIR, job_id)
         self.speaker_audio_paths = {}
+        self.noise_reduced_paths = {}
         self.transcriptions = {}
         self.error = None
+        self.has_timestamps = False
         os.makedirs(self.result_dir, exist_ok=True)
 
     def to_dict(self):
@@ -216,8 +318,10 @@ class Job:
             "job_id": self.job_id,
             "status": self.status,
             "speaker_audio_paths": {k: os.path.basename(v) for k, v in self.speaker_audio_paths.items()} if self.speaker_audio_paths else {},
+            "noise_reduced": {k: os.path.basename(v) for k, v in self.noise_reduced_paths.items()} if self.noise_reduced_paths else {},
             "transcriptions": self.transcriptions,
-            "error": self.error
+            "error": self.error,
+            "has_timestamps": self.has_timestamps
         }
 
 
@@ -235,7 +339,7 @@ def convert_to_wav(audio_path, output_path=None):
     return output_path
 
 
-def perform_diarization(audio_path, hf_token=None):
+def perform_diarization(audio_path, hf_token=DEFAULT_HF_TOKEN):
     """Perform speaker diarization on audio file"""
     logger.info("Performing speaker diarization...")
     
@@ -244,7 +348,7 @@ def perform_diarization(audio_path, hf_token=None):
     
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.0",
-        use_auth_token=os.environ["HF_TOKEN"]
+        use_auth_token=DEFAULT_HF_TOKEN
     )
     
     diarization = pipeline(audio_path)
@@ -299,29 +403,145 @@ def extract_speaker_audio(audio_path, speaker_segments, output_dir):
     return speaker_audio_paths
 
 
+
+def transcribe_audio_with_timestamps(audio_paths):
+    """Transcribe audio for each speaker with timestamps"""
+    logger.info("Transcribing audio for each speaker with timestamps...")
+    
+    # Add Homebrew ffmpeg path to system PATH if on MacOS
+    if os.path.exists("/opt/homebrew/bin"):
+        os.environ["PATH"] += os.pathsep + "/opt/homebrew/bin"
+    
+    model = whisper.load_model("base", device="cpu")
+    transcriptions = {}
+
+    for speaker, audio_path in audio_paths.items():
+        logger.info(f"Transcribing {speaker} with timestamps...")
+
+        audio = whisper.load_audio(audio_path)
+        result = whisper.transcribe(model, audio, language="en")
+        logger.info(f"Transcription for {speaker} completed")
+
+        # Full text
+        text = result["text"]
+
+        # Gather word-level timestamps from segments
+        words = []
+        for segment in result["segments"]:
+            if "words" in segment:
+                words.extend(segment["words"])
+
+        # Collect both in the dictionary
+        transcriptions[speaker] = {
+            "text": text,
+            "words": words
+        }
+
+        logger.info(f"{speaker}: {text}")
+
+    return transcriptions
+
+
 def transcribe_audio(audio_paths):
-    """Transcribe audio for each speaker"""
-    logger.info("Transcribing audio for each speaker...")
+    print("Transcribing audio for each speaker...")
     model = whisper.load_model("base")
     transcriptions = {}
-    
+
     for speaker, audio_path in audio_paths.items():
-        logger.info(f"Transcribing {speaker}...")
+        print(f"Transcribing {speaker}...")
         result = model.transcribe(audio_path)
-        transcriptions[speaker] = result["text"]
-        logger.info(f"{speaker}: {result['text']}")
-    
+        transcriptions[speaker] = {
+            "text": result["text"]
+        }
+        print(f"{speaker}: {result['text']}")
+
     return transcriptions
 
 
 def save_transcriptions(transcriptions, output_dir):
-    """Save transcriptions to file"""
-    output_path = os.path.join(output_dir, "transcriptions.txt")
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, "transcriptions.json")
+
     with open(output_path, "w", encoding="utf-8") as f:
-        for speaker, text in transcriptions.items():
-            f.write(f"{speaker}: {text}\n\n")
-    logger.info(f"Saved transcriptions to {output_path}")
+        json.dump(transcriptions, f, indent=2, ensure_ascii=False)
+
+    print(f"Saved transcriptions to {output_path}")
+
+
+
+def save_transcriptions_with_timestamps(transcriptions, output_dir):
+    """Save transcriptions with timestamps to JSON file"""
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, "transcriptions_with_timestamps.json")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(transcriptions, f, indent=2, ensure_ascii=False)
+
+    logger.info(f"Saved transcriptions with timestamps to {output_path}")
     return output_path
+
+
+def reduce_noise_for_audios(audio_paths, output_dir, save_waveforms=True):
+    """Reduce noise for each speaker's audio"""
+    logger.info("Reducing noise for speaker audio files...")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    noise_reduced_paths = {}
+
+    for speaker, audio_path in audio_paths.items():
+        logger.info(f"Reducing noise for {speaker}...")
+
+        # Read audio file
+        data, rate = sf.read(audio_path)
+
+        # Apply noise reduction
+        reduced_noise = nr.reduce_noise(
+            y=data,
+            sr=rate,
+            thresh_n_mult_nonstationary=2,
+            stationary=False
+        )
+
+        # Extract input filename without extension
+        input_name = os.path.splitext(os.path.basename(audio_path))[0]
+
+        # Build the output file path
+        output_audio_path = os.path.join(output_dir, f"{input_name}_noise_reduced.wav")
+
+        # Save reduced noise audio as WAV
+        sf.write(output_audio_path, reduced_noise, rate)
+        logger.info(f"Saved reduced noise audio for {speaker} at {output_audio_path}")
+        
+        noise_reduced_paths[speaker] = output_audio_path
+
+        # Optionally save waveforms
+        if save_waveforms:
+            time_axis = np.linspace(0, len(data) / rate, num=len(data))
+
+            # Plot original and reduced noise waveforms
+            plt.figure(figsize=(14, 6))
+            plt.subplot(2, 1, 1)
+            plt.plot(time_axis, data, color='gray')
+            plt.title(f"{speaker} - Original Audio Waveform")
+            plt.xlabel("Time (s)")
+            plt.ylabel("Amplitude")
+
+            plt.subplot(2, 1, 2)
+            plt.plot(time_axis, reduced_noise, color='blue')
+            plt.title(f"{speaker} - Noise Reduced Audio Waveform")
+            plt.xlabel("Time (s)")
+            plt.ylabel("Amplitude")
+
+            plt.tight_layout()
+
+            # Save waveform plot
+            waveform_path = os.path.join(output_dir, f"{input_name}_waveforms.png")
+            plt.savefig(waveform_path)
+            plt.close()
+
+            logger.info(f"Saved waveform plot for {speaker} at {waveform_path}")
+    
+    return noise_reduced_paths
 
 
 async def process_audio_task(job_id):
@@ -340,11 +560,18 @@ async def process_audio_task(job_id):
         # Step 3: Extract speaker audio
         job.speaker_audio_paths = extract_speaker_audio(wav_path, speaker_segments, job.result_dir)
         
-        # Step 4: Transcribe
-        job.transcriptions = transcribe_audio(job.speaker_audio_paths)
+        # Step 4: Transcribe based on user preference
+        if job.use_timestamps:
+            job.transcriptions = transcribe_audio_with_timestamps(job.speaker_audio_paths)
+            job.has_timestamps = True
+            save_transcriptions_with_timestamps(job.transcriptions, job.result_dir)
+        else:
+            job.transcriptions = transcribe_audio(job.speaker_audio_paths)
+            save_transcriptions(job.transcriptions, job.result_dir)
         
-        # Step 5: Save transcriptions
-        save_transcriptions(job.transcriptions, job.result_dir)
+        # Step 5: Reduce noise if requested
+        if job.reduce_noise:
+            job.noise_reduced_paths = reduce_noise_for_audios(job.speaker_audio_paths, job.result_dir, save_waveforms=True)
         
         job.status = "completed"
         logger.info(f"Job {job_id} completed successfully")
@@ -363,7 +590,9 @@ async def root(request: Request):
 @app.post("/process/")
 async def process_audio(background_tasks: BackgroundTasks, 
                         audio_file: UploadFile = File(...), 
-                        hf_token: Optional[str] = Form(None)):
+                        hf_token: Optional[str] = Form(None),
+                        use_timestamps: bool = Form(False),
+                        reduce_noise: bool = Form(False)):
     """Process audio file and return job ID"""
     try:
         # Generate job ID
@@ -378,8 +607,8 @@ async def process_audio(background_tasks: BackgroundTasks,
         with open(file_path, "wb") as f:
             shutil.copyfileobj(audio_file.file, f)
         
-        # Create job
-        job = Job(job_id, file_path, hf_token)
+        # Create job with toggle options
+        job = Job(job_id, file_path, hf_token, use_timestamps, reduce_noise)
         jobs[job_id] = job
         
         # Start processing in background
@@ -417,6 +646,13 @@ async def download_file(job_id: str, filename: str):
             if speaker == filename:
                 file_path = path
                 break
+        
+        # Check if it's a noise-reduced file
+        if not os.path.exists(file_path) and job.noise_reduced_paths:
+            for speaker, path in job.noise_reduced_paths.items():
+                if os.path.basename(path) == filename:
+                    file_path = path
+                    break
         
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="File not found")
