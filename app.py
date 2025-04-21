@@ -21,6 +21,8 @@ import uvicorn
 import logging
 
 DEFAULT_HF_TOKEN = os.environ.get("HF_TOKEN", "")
+print(DEFAULT_HF_TOKEN)
+hf_token=os.environ.get("HF_TOKEN", "")
 
 # Setup logging
 logging.basicConfig(
