@@ -238,11 +238,27 @@ with open(os.path.join(templates_dir, "index.html"), "w") as f:
                             downloadLinks.innerHTML = '<h3>Download Files</h3><ul>';
                             
                             for (const [speaker, path] of Object.entries(result.speaker_audio_paths || {})) {
-                                downloadLinks.innerHTML += `<li><a href="/download/${jobId}/${speaker}" download>${speaker}.wav</a></li>`;
+                                downloadLinks.innerHTML += `<li><a href="/download/${jobId}/${speaker}" download><strong>${speaker}.wav</strong></a></li>`;
+                                downloadLinks.innerHTML += `
+                                        <li>
+                                            <audio controls>
+                                                <source src="/download/${jobId}/${speaker}" type="audio/wav">
+                                                Your browser does not support the audio element.
+                                            </audio>
+                                        </li>
+                                    `;
                                 
                                 // Add noise reduced files if they exist
                                 if (result.noise_reduced && result.noise_reduced[speaker]) {
                                     downloadLinks.innerHTML += `<li><a href="/download/${jobId}/${result.noise_reduced[speaker]}" download>${speaker}_noise_reduced.wav</a></li>`;
+                                    downloadLinks.innerHTML += `
+                                        <li>
+                                            <audio controls>
+                                                <source src="/download/${jobId}/${speaker}_noise_reduced.wav" type="audio/wav">
+                                                Your browser does not support the audio element.
+                                            </audio>
+                                        </li>
+                                    `;
                                 }
                             }
                             
